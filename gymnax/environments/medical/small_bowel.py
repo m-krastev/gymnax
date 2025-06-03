@@ -1,7 +1,10 @@
 """Small Bowel Environment for JAX."""
 
+from dataclasses import field
 from functools import partial
 
+import flax
+import flax.nnx
 import jax
 import jax.numpy as jnp
 from flax import struct
@@ -15,197 +18,113 @@ def _is_valid_pos(pos_vox: jnp.ndarray, shape: tuple[int, int, int]) -> jnp.ndar
     return jnp.all(pos_vox >= 0) & jnp.all(pos_vox < jnp.array(shape))
 
 
+@partial(jax.jit, static_argnames=("patch_size",))
 def get_patch_jax(
-    volume: jnp.ndarray, center_coords: jnp.ndarray, patch_size: tuple[int, int, int]
+    volume: jnp.ndarray, center_coords: jnp.ndarray, patch_size: jnp.ndarray
 ) -> jnp.ndarray:
     """
     Extracts a patch from a 3D volume centered at center_coords.
     Handles padding for out-of-bounds regions.
     """
-    volume_shape = jnp.array(volume.shape)
-    patch_size_arr = jnp.array(patch_size)
-    half_patch = patch_size_arr // 2
+    patch = jnp.zeros_like(volume, shape=patch_size)
 
-    start_coords = center_coords - half_patch
-    end_coords = start_coords + patch_size_arr
-
-    # Calculate padding
-    pad_before = jnp.maximum(0, -start_coords)
-    pad_after = jnp.maximum(0, end_coords - volume_shape)
-
-    # Pad the volume
-    padded_volume = jnp.pad(
-        volume,
-        (
-            (pad_before[0], pad_after[0]),
-            (pad_before[1], pad_after[1]),
-            (pad_before[2], pad_after[2]),
-        ),
-        mode="constant",
-        constant_values=0,
+    # Calculate the slice indices for the patch
+    start_coords = jnp.maximum(0, center_coords - jnp.asarray(patch_size) // 2)
+    patch = jax.lax.dynamic_update_slice(
+        patch, jax.lax.dynamic_slice(volume, start_coords, patch_size), start_coords
     )
-
-    # Adjust slice coordinates for the padded volume
-    padded_start_coords = start_coords + pad_before
-
-    # Extract the patch
-    patch = jax.lax.dynamic_slice(padded_volume, padded_start_coords, patch_size)
     return patch
 
 
+@partial(jax.jit, static_argnames=("max_npoints",))
 def line_nd_jax(
-    start: jnp.ndarray, end: jnp.ndarray, shape: tuple[int, int, int]
-) -> jnp.ndarray:
+    start: jnp.ndarray, stop: jnp.ndarray, max_npoints: int
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     JAX-compatible function to get voxels along a 3D line segment using Bresenham's algorithm.
-    Returns a boolean mask of the line in the given shape.
+
+    NOTE: This function is JIT-able using a fixed `max_npoints` to ensure the output shape is static.
+
+    # The minimum number of points along the segment is `int(ceil(max(abs(stop - start))))`
+
+    Args:
+        start: JAX array representing the start coordinates (e.g., shape (D,)).
+        stop: JAX array representing the stop coordinates (e.g., shape (D,)).
+        max_npoints: A static integer indicating the maximum possible number of points the line could have. This defines the fixed size of the output array.
+
+    Returns:
+        A tuple containing:
+        - padded_coords: A JAX array of shape (D, max_npoints) with the line coordinates.
     """
-    # Ensure integer coordinates
-    start = jnp.round(start).astype(jnp.int32)
-    end = jnp.round(end).astype(jnp.int32)
+    return jnp.round(
+        jnp.linspace(start, stop, num=max_npoints, endpoint=False).T
+    ).astype(int)
 
-    # Calculate differences
-    dx, dy, dz = end - start
-
-    # Determine step directions
-    sx = jnp.sign(dx)
-    sy = jnp.sign(dy)
-    sz = jnp.sign(dz)
-
-    # Absolute differences
-    ax = jnp.abs(dx)
-    ay = jnp.abs(dy)
-    az = jnp.abs(dz)
-
-    # Initialize current position
-    x, y, z = start[0], start[1], start[2]
-
-    # Initialize mask
-    mask = jnp.zeros(shape, dtype=jnp.bool_)
-
-    # Helper to update mask and position
-    def _update_mask_and_pos(carry, _):
-        current_x, current_y, current_z, err_1, err_2, err_3, current_mask = carry
-
-        # Mark current voxel
-        current_mask = jax.lax.dynamic_update_slice(
-            current_mask, jnp.array([True]), (current_x, current_y, current_z)
-        )
-
-        # Bresenham logic
-        e2 = 2 * err_1
-        e3 = 2 * err_2
-        e4 = 2 * err_3
-
-        # Update x
-        x_cond = (e2 > -ax) & (e3 > -ax) & (e4 > -ax)
-        current_x = jnp.where(x_cond, current_x + sx, current_x)
-        err_1 = jnp.where(x_cond, err_1 - ax, err_1)
-        err_2 = jnp.where(x_cond, err_2 - ax, err_2)
-        err_3 = jnp.where(x_cond, err_3 - ax, err_3)
-
-        # Update y
-        y_cond = (e2 < ay) & (e3 < ay) & (e4 < ay)
-        current_y = jnp.where(y_cond, current_y + sy, current_y)
-        err_1 = jnp.where(y_cond, err_1 + ay, err_1)
-        err_2 = jnp.where(y_cond, err_2 + ay, err_2)
-        err_3 = jnp.where(y_cond, err_3 + ay, err_3)
-
-        # Update z
-        z_cond = (e2 < az) & (e3 < az) & (e4 < az)
-        current_z = jnp.where(z_cond, current_z + sz, current_z)
-        err_1 = jnp.where(z_cond, err_1 + az, err_1)
-        err_2 = jnp.where(z_cond, err_2 + az, err_2)
-        err_3 = jnp.where(z_cond, err_3 + az, err_3)
-
-        return (
-            current_x,
-            current_y,
-            current_z,
-            err_1,
-            err_2,
-            err_3,
-            current_mask,
-        ), None
-
-    # Max length of the line segment
-    max_len = jnp.max(jnp.array([ax, ay, az])) + 1
-
-    # Initial errors
-    err_1 = ax + ay + az
-    err_2 = err_1 - 2 * ax
-    err_3 = err_1 - 2 * ay
-    err_4 = (
-        err_1 - 2 * az
-    )  # This was err_3 in the original, but it should be err_4 for 3D
-
-    # Use lax.scan for the loop
-    (final_x, final_y, final_z, final_err1, final_err2, final_err3, final_mask), _ = (
-        jax.lax.scan(
-            _update_mask_and_pos,
-            (x, y, z, err_1, err_2, err_3, mask),
-            None,
-            length=max_len,
-        )
-    )
-
-    # Mark the end point explicitly
-    mask = jax.lax.dynamic_update_slice(
-        final_mask, jnp.array([True]), (end[0], end[1], end[2])
-    )
-
-    return mask
-
-
+# @partial(jax.jit, static_argnames=("radius",))
 def binary_dilation_3d_jax(mask: jnp.ndarray, radius: int) -> jnp.ndarray:
     """
     Performs 3D binary dilation on a boolean mask using a cubic structuring element.
     """
-    if radius == 0:
-        return mask
+    # Dilation is defined as a convolution with the structuring element.
+    # We can use a fori_loop to iterate over the structuring element
 
-    # Create a cubic structuring element
-    struct_elem_size = 2 * radius + 1
-    struct_elem = jnp.ones(
-        (struct_elem_size, struct_elem_size, struct_elem_size), dtype=jnp.bool_
+    kernel = jnp.array(
+        [
+            [[0, 1, 0], [1, 1, 1], [0, 1, 0]],  # 3x3x3 kernel for dilation
+            [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
+            [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
+        ],
+        dtype=jnp.bool_,
+    )[:, :, :, None, None]
+
+    mask = mask[None, ..., None]  # Add batch and channel dimensions
+    # Describes batch, spatial, and feature dimensions of a convolution.
+    # 1: input_kernel_channels, 2: input_spatial_dimensions, 3: output_spatial_dimensions
+    dn = jax.lax.conv_dimension_numbers(
+        mask.shape, kernel.shape, ("NHWDC", "HWDIO", "NHWDC")
     )
-
-    # Pad the mask to handle boundaries during convolution
-    padded_mask = jnp.pad(mask, radius, mode="constant", constant_values=False)
-
-    # Use max pooling as dilation for binary masks
-    dilated_mask = jax.lax.max_pool(
-        padded_mask,
-        window_shape=(struct_elem_size, struct_elem_size, struct_elem_size),
-        strides=(1, 1, 1),
-        padding="VALID",
-    )
-    return dilated_mask
+    return jax.lax.fori_loop(
+        0,
+        radius + 1,
+        lambda i, acc: jax.lax.conv_general_dilated(
+            acc,
+            kernel,
+            window_strides=(1, 1, 1),
+            padding="SAME",
+            dimension_numbers=dn,
+        ),
+        mask,
+        # unroll=True,
+    )[0, ..., 0]  # Remove batch and channel dimensions
 
 
 def draw_path_sphere_2_jax(
     cumulative_path_mask: jnp.ndarray,
-    line_voxels_mask: jnp.ndarray,
+    line: tuple[jnp.ndarray],
     dilation_radius: int,
-    gt_path_vol: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Updates the cumulative path mask and ground truth path volume.
-    This is a JAX-compatible version of the original TorchRL function.
+    Draws a "sphere" around the path defined by `line` in the cumulative path mask.
+    This function dilates the line voxels to create a spherical region around the path.
+
+    Args:
+        cumulative_path_mask: The cumulative path mask to update.
+        line: A tuple containing the coordinates of the line voxels (e.g., from `line_nd_jax`).
+        dilation_radius: The radius for dilation to create the spherical region.
+
+    Returns:
+        A tuple containing:
+        - new_cumulative_path_mask: The updated cumulative path mask after adding the spherical region.
+        - dilated_line_mask: The mask representing the dilated spherical region around the path.
     """
     # Dilate the line voxels to create a "sphere" around the path
-    dilated_line_mask = binary_dilation_3d_jax(line_voxels_mask, dilation_radius)
+    buffer = jnp.zeros_like(cumulative_path_mask, dtype=jnp.bool_).at[*line].set(1)
+    dilated_line_mask = binary_dilation_3d_jax(buffer, dilation_radius)
 
     # Update cumulative_path_mask: union of current mask and new dilated path
     new_cumulative_path_mask = cumulative_path_mask | dilated_line_mask
 
-    # Update gt_path_vol: this part is tricky as the original modifies in place.
-    # The original logic was `self.gt_path_vol[self.cumulative_path_mask > 0] = 0`.
-    # This means any part of the GT path that is now covered by the *new* cumulative path
-    # should be zeroed out.
-    new_gt_path_vol = gt_path_vol * (~new_cumulative_path_mask)
-
-    return new_cumulative_path_mask, new_gt_path_vol
+    return new_cumulative_path_mask, dilated_line_mask
 
 
 @struct.dataclass
@@ -218,19 +137,19 @@ class SmallBowelState(environment.EnvState):
     cum_reward: float
     reward_map: jnp.ndarray  # (D, H, W) float, for peaks
     wall_gradient: float
-    key: jax.Array
+    length: float
 
 
-@struct.dataclass
+@struct.dataclass(kw_only=True)
 class SmallBowelParams(environment.EnvParams):
     """Parameters for the Small Bowel environment."""
 
     image: jnp.ndarray  # (D, H, W) float
     seg: jnp.ndarray  # (D, H, W) bool
     wall_map: jnp.ndarray  # (D, H, W) float
+    gt_path_vol: jnp.ndarray  # (D, H, W) bool
     gdt_start: jnp.ndarray  # (D, H, W) float
     gdt_end: jnp.ndarray  # (D, H, W) float
-    gt_path_vol: jnp.ndarray  # (D, H, W) bool
     local_peaks: jnp.ndarray  # (N, 3) int
     start_coord: jnp.ndarray  # (3,) int
     end_coord: jnp.ndarray  # (3,) int
@@ -243,10 +162,18 @@ class SmallBowelParams(environment.EnvParams):
     r_peaks: float = 10.0
     gdt_max_increase_theta: float = 5.0
     max_step_vox: float = 5.0  # Max movement in voxels
-    patch_size_vox: tuple[int, int, int] = (32, 32, 32)
+    # patch_size_vox: jnp.ndarray = field(
+    #     default_factory=lambda: jnp.array([32, 32, 32], dtype=jnp.int32)
+    # )
+    patch_size_vox: jnp.ndarray = struct.field(
+        pytree_node=False,
+        default=(32, 32, 32),  # Default patch size in voxels
+    )
     cumulative_path_radius_vox: int = 3
     seg_volume: float = 0.0  # Will be calculated from seg
-    image_shape: tuple[int, int, int] = (0, 0, 0)  # Will be set from image shape
+    image_shape: jnp.ndarray = field(
+        default_factory=lambda: jnp.array([1, 1, 1], dtype=jnp.int32)
+    )
 
 
 class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
@@ -273,43 +200,19 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             start_coord=jnp.zeros((3,), dtype=jnp.int32),
             end_coord=jnp.zeros((3,), dtype=jnp.int32),
             goal=jnp.zeros((3,), dtype=jnp.int32),
-            image_shape=(1, 1, 1),
+            image_shape=jnp.ones((3,), dtype=jnp.int32),  # Placeholder
             seg_volume=0.0,
         )
 
-    @partial(jax.jit, static_argnames=("self",))
     def reset_env(
         self, key: jax.Array, params: SmallBowelParams
     ) -> tuple[jnp.ndarray, SmallBowelState]:
         """Resets the environment."""
         key, key_choice, key_shuffle = jax.random.split(key, 3)
-
-        # Determine start position and select appropriate GDT
-        # rand = jax.random.randint(key_choice, (), 0, 10) # 40-40-20 distribution
-        # Using a simpler random choice for now, can be expanded later
-
-        # For simplicity, let's always start at start_coord and go to end_coord for now.
-        # The original logic with random start/goal and local_peaks is more complex
-        # and involves `random.choice` which is not directly JAX-compatible without
-        # careful `jax.random` usage and `lax.cond` or `lax.switch`.
-        # I will implement a simplified version first, then refine.
-
-        # Simplified start/goal selection: always start at start_coord, go to end_coord
-        current_pos_vox = params.start_coord
-        goal = params.end_coord
-        gdt_map = params.gdt_start
-
-        # If local_peaks are available, randomly choose one as start/goal
-        # This requires more complex JAX logic (e.g., lax.cond, lax.switch)
-        # to replicate the 40-40-20 distribution and random choice.
-        # For now, I'll use a simpler random choice from local_peaks if available,
-        # otherwise default to start_coord.
-
-        # Replicating the random start logic from TorchRL env:
+        # Random start logic:
         # 0-3: start_coord -> end_coord (gdt_start)
         # 4-5: random local peak -> (end_coord or start_coord) (gdt_start or gdt_end)
         # 6-9: end_coord -> start_coord (gdt_end)
-
         rand_choice = jax.random.randint(key_choice, (), 0, 10)
 
         # Case 1: Start at beginning, go to end
@@ -389,9 +292,6 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         )
 
         # Validate start position (simplified check for now)
-        # The original had a while loop, which is not JAX-compatible.
-        # We need to use lax.cond or ensure valid inputs.
-        # For now, assume valid start_coord from params.
         is_valid_start = (
             _is_valid_pos(current_pos_vox, params.image_shape)
             & params.seg[tuple(current_pos_vox)]
@@ -405,17 +305,15 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         gdt_map = jax.lax.select(is_valid_start, gdt_map, params.gdt_start)
 
         # Initialize path tracking
-        cumulative_path_mask = jnp.zeros(params.image_shape, dtype=jnp.bool_)
+        # print(params.image_shape)
+        cumulative_path_mask = jnp.zeros_like(params.image, dtype=jnp.bool_)
 
         # Mark initial position on cumulative path mask
-        initial_line_mask = line_nd_jax(
-            current_pos_vox, current_pos_vox, params.image_shape
-        )
-        cumulative_path_mask, new_gt_path_vol = draw_path_sphere_2_jax(
+        line = line_nd_jax(current_pos_vox, current_pos_vox, 256)
+        cumulative_path_mask, _ = draw_path_sphere_2_jax(
             cumulative_path_mask,
-            initial_line_mask,
+            line,
             params.cumulative_path_radius_vox,
-            params.gt_path_vol,
         )
 
         # Initialize various tracking variables
@@ -423,7 +321,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         max_gdt_achieved = gdt_map[tuple(current_pos_vox)]
 
         # Initialize reward_map for peaks
-        reward_map = jnp.zeros(params.image_shape, dtype=jnp.float32)
+        reward_map = jnp.zeros_like(params.image, dtype=jnp.float32)
         # Scatter 1s at local peaks
         reward_map = reward_map.at[tuple(params.local_peaks.T)].set(1.0)
 
@@ -437,7 +335,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             cum_reward=cum_reward,
             reward_map=reward_map,
             wall_gradient=wall_gradient,
-            key=key,
+            length=0.0,
         )
 
         obs = self.get_obs(state, params)
@@ -454,8 +352,8 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         """Performs a step transition in the environment."""
         key, key_reward = jax.random.split(key)
 
-        # Extract Action: action is normalized [-1, 1]
-        action_mapped = action * params.max_step_vox
+        # Extract Action: action is normalized [0, 1]
+        action_mapped = (2 * action - 1) * params.max_step_vox
         action_vox_delta = jnp.round(action_mapped).astype(jnp.int32)
 
         # Calculate next position
@@ -536,7 +434,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             cum_reward=new_cum_reward,
             reward_map=new_reward_map,
             wall_gradient=new_wall_gradient,
-            key=key,
+            length=state.length + jnp.linalg.norm(next_pos_vox - state.current_pos_vox),
         )
 
         obs = self.get_obs(state, params)
@@ -547,7 +445,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             "final_step_count": jax.lax.select(done, state.time, 0),
             "final_length": jax.lax.select(
                 done,
-                jnp.linalg.norm(state.current_pos_vox - state.current_pos_vox),
+                state.length,
                 0.0,
             ),  # Simplified length
             "final_wall_gradient": jax.lax.select(done, state.wall_gradient, 0.0),
@@ -584,17 +482,16 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         wall_stuff = jnp.array(0.0, dtype=jnp.float32)
 
         is_next_pos_valid = _is_valid_pos(next_pos_vox, image_shape)
-        is_in_seg = jax.lax.select(is_next_pos_valid, seg[tuple(next_pos_vox)], False)
+        # is_in_seg = jnp.where(is_next_pos_valid, seg[tuple(next_pos_vox)], False)
 
         # --- 1. Zero movement or goes out of the segmentation penalty ---
-        # If not any(action_vox) or not self._is_valid_pos(next_pos_vox) or not self.seg_np[next_pos_vox]:
         cond_invalid_move = (
-            (jnp.all(action_vox_delta == 0)) | (~is_next_pos_valid) | (~is_in_seg)
+            (jnp.all(action_vox_delta == 0)) | (~is_next_pos_valid)  # | (~is_in_seg)
         )
         rt = jax.lax.select(cond_invalid_move, rt - r_zero_mov, rt)
 
         # Set of voxels S on the line segment
-        line_mask = line_nd_jax(current_pos_vox, next_pos_vox, image_shape)
+        line = line_nd_jax(current_pos_vox, next_pos_vox, 256)
 
         # Only proceed with rewards if move is valid
         rt, new_cumulative_path_mask, new_reward_map, wall_stuff = jax.lax.cond(
@@ -607,7 +504,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             ),  # If invalid, no further reward/mask updates
             lambda: self._calculate_valid_move_rewards(
                 rt,
-                line_mask,
+                line,
                 cumulative_path_mask,
                 reward_map,
                 gdt_map,
@@ -630,7 +527,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
     def _calculate_valid_move_rewards(
         self,
         rt: jnp.ndarray,
-        line_mask: jnp.ndarray,
+        line: tuple[jnp.ndarray],
         cumulative_path_mask: jnp.ndarray,
         reward_map: jnp.ndarray,
         gdt_map: jnp.ndarray,
@@ -651,52 +548,53 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         # --- 2. GDT-based reward ---
         next_gdt_val = gdt_map[tuple(next_pos_vox)]
         delta = next_gdt_val - max_gdt_achieved
-
-        # Penalty if too large, reward if within margins
-        rt = rt + jax.lax.select(
-            delta > gdt_max_increase_theta,
-            -r_val2,
-            r_val2 * (delta / gdt_max_increase_theta),
+        rt += jax.lax.select(
+            delta > 0,
+            jax.lax.select(
+                delta > gdt_max_increase_theta,
+                -r_val2,
+                r_val2 * (delta / gdt_max_increase_theta),
+            ),
+            0.0,
         )
 
         # --- 2.5 Peaks-based reward ---
-        peaks_reward_sum = jnp.sum(reward_map * line_mask)
-        rt = rt + peaks_reward_sum * r_peaks
+        peaks_reward_sum = jnp.sum(
+            reward_map.at[line[0], line[1], line[2]].get(indices_are_sorted=True).mean()
+        )
+        rt += peaks_reward_sum * r_peaks
 
         # Discard the reward for visited nodes (set to 0 in reward_map)
-        new_reward_map = reward_map.at[line_mask].set(0.0)
+        new_reward_map = reward_map.at[line[0], line[1], line[2]].set(0.0)
 
-        # Update cumulative path mask and gt_path_vol
-        new_cumulative_path_mask, new_gt_path_vol_updated = draw_path_sphere_2_jax(
-            cumulative_path_mask, line_mask, cumulative_path_radius_vox, gt_path_vol
+        # Update cumulative path mask
+        new_cumulative_path_mask, coverage = draw_path_sphere_2_jax(
+            cumulative_path_mask, line, cumulative_path_radius_vox
         )
 
         # Reward for coverage (based on Dice within the segmentation on the path)
-        # The original used `self.gt_path_vol` which was modified in place.
-        # Here, `new_gt_path_vol_updated` is the updated GT path volume.
-        intersection = jnp.sum(new_gt_path_vol_updated * seg)
-        union = seg_volume + jnp.sum(new_gt_path_vol_updated)
+        intersection = jnp.sum(coverage * seg)
+        union = seg_volume + jnp.sum(coverage)
         coverage = jax.lax.select(union != 0, 2 * intersection / union, 0.0)
         rt = rt + coverage * r_val2
 
         # --- 3. Wall-based penalty ---
-        wall_map_max = jnp.max(wall_map * line_mask)  # Max wall value along the line
+        wall_map_max = wall_map.at[line[0], line[1], line[2]].get().max()
         wall_stuff = wall_map_max
         rt = rt - r_val2 * wall_map_max * 30
 
         # --- 4. Revisiting penalty ---
-        revisit_penalty = jnp.sum(
-            new_cumulative_path_mask * line_mask
+        revisit_penalty = (
+            new_cumulative_path_mask.at[line[0], line[1], line[2]].get().any()
         )  # Check against the *new* mask
         rt = rt - r_val1 * jax.lax.select(
             revisit_penalty > 0, 1.0, 0.0
         )  # Apply penalty if any overlap
 
-        # Penalty if next position is outside segmentation (already handled by cond_invalid_move, but double check)
+        # Penalty if next position is outside segmentation
         # This was `if not self.seg_np[next_pos_vox]: rt -= self.config.r_val1`
         # This is now covered by `cond_invalid_move` at the top level.
         # If we reach here, it means `is_in_seg` was True.
-
         return rt, new_cumulative_path_mask, new_reward_map, wall_stuff
 
     @partial(jax.jit, static_argnames=("self",))
@@ -711,9 +609,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             params.wall_map, state.current_pos_vox, params.patch_size_vox
         )
         cum_path_patch = get_patch_jax(
-            state.cumulative_path_mask.astype(
-                jnp.float32
-            ),  # Convert bool to float for stacking
+            state.cumulative_path_mask.astype(jnp.float32),
             state.current_pos_vox,
             params.patch_size_vox,
         )
@@ -722,9 +618,8 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         actor_state = jnp.stack([img_patch, wall_patch, cum_path_patch], axis=0)
         critic_state = jnp.stack([img_patch, wall_patch, cum_path_patch], axis=0)
 
-        # Add batch dimension (Gymnax expects observations without batch dim, but TorchRL had it)
         # For Gymnax, we return the raw observation. The agent will handle batching.
-        return {"actor": actor_state, "critic": critic_state}
+        return jnp.stack([actor_state, critic_state], axis=0)
 
     @partial(jax.jit, static_argnames=("self",))
     def is_terminal(
@@ -741,15 +636,15 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
         # Out of bounds or invalid move (already checked in _calculate_reward, but re-check for termination)
         is_next_pos_valid = _is_valid_pos(next_pos_vox, params.image_shape)
-        is_in_seg = jax.lax.select(
-            is_next_pos_valid, params.seg[tuple(next_pos_vox)], False
-        )
+        # is_in_seg = jnp.where(
+        #     is_next_pos_valid, params.seg[tuple(next_pos_vox)] > 0, False
+        # )
 
         invalid_move = (
             (jnp.all(action_vox_delta == 0))
             | (~is_next_pos_valid)
-            | (~is_in_seg)
             | (wall_stuff > 0.03)
+            # | (~is_in_seg)
         )
 
         # Reached goal
@@ -776,19 +671,18 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
     def action_space(self, params: SmallBowelParams) -> spaces.Box:
         """Action space of the environment."""
-        # Action is a 3D vector representing delta movement, normalized to [-1, 1]
         return spaces.Box(
-            low=jnp.array([-1.0, -1.0, -1.0], dtype=jnp.float32),
+            low=jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32),
             high=jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),
             shape=(3,),
             dtype=jnp.float32,
         )
 
-    def observation_space(self, params: SmallBowelParams) -> spaces.dict:
+    def observation_space(self, params: SmallBowelParams) -> spaces.Dict:
         """Observation space of the environment."""
         # Observations are actor and critic patches, each 3 channels
         patch_shape = (3, *params.patch_size_vox)
-        return spaces.dict({
+        return spaces.Dict({
             "actor": spaces.Box(
                 low=-jnp.inf, high=jnp.inf, shape=patch_shape, dtype=jnp.float32
             ),
@@ -797,9 +691,9 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             ),
         })
 
-    def state_space(self, params: SmallBowelParams) -> spaces.dict:
+    def state_space(self, params: SmallBowelParams) -> spaces.Dict:
         """State space of the environment."""
-        return spaces.dict({
+        return spaces.Dict({
             "time": spaces.Discrete(params.max_steps_in_episode + 1),
             "current_pos_vox": spaces.Box(
                 low=jnp.array([0, 0, 0], dtype=jnp.int32),
@@ -822,7 +716,4 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             "wall_gradient": spaces.Box(
                 low=-jnp.inf, high=jnp.inf, shape=(), dtype=jnp.float32
             ),
-            "key": spaces.Box(
-                low=-jnp.inf, high=jnp.inf, shape=(2,), dtype=jnp.uint32
-            ),  # JAX random key is a pair of uint32
         })
