@@ -3,8 +3,6 @@
 from dataclasses import field
 from functools import partial
 
-import flax
-import flax.nnx
 import jax
 import jax.numpy as jnp
 from flax import struct
@@ -60,7 +58,9 @@ def line_nd_jax(
         jnp.linspace(start, stop, num=max_npoints, endpoint=False).T
     ).astype(int)
 
-# @partial(jax.jit, static_argnames=("radius",))
+@partial(
+    jax.jit,
+)
 def binary_dilation_3d_jax(mask: jnp.ndarray, radius: int) -> jnp.ndarray:
     """
     Performs 3D binary dilation on a boolean mask using a cubic structuring element.
@@ -74,7 +74,7 @@ def binary_dilation_3d_jax(mask: jnp.ndarray, radius: int) -> jnp.ndarray:
             [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
             [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
         ],
-        dtype=jnp.bool_,
+        dtype=mask.dtype,
     )[:, :, :, None, None]
 
     mask = mask[None, ..., None]  # Add batch and channel dimensions
@@ -98,10 +98,11 @@ def binary_dilation_3d_jax(mask: jnp.ndarray, radius: int) -> jnp.ndarray:
     )[0, ..., 0]  # Remove batch and channel dimensions
 
 
-def draw_path_sphere_2_jax(
+def draw_path_sphere(
     cumulative_path_mask: jnp.ndarray,
     line: tuple[jnp.ndarray],
     dilation_radius: int,
+    fill_value: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Draws a "sphere" around the path defined by `line` in the cumulative path mask.
@@ -118,7 +119,9 @@ def draw_path_sphere_2_jax(
         - dilated_line_mask: The mask representing the dilated spherical region around the path.
     """
     # Dilate the line voxels to create a "sphere" around the path
-    buffer = jnp.zeros_like(cumulative_path_mask, dtype=jnp.bool_).at[*line].set(1)
+    buffer = (
+        jnp.zeros_like(cumulative_path_mask, dtype=jnp.bool_).at[*line].set(fill_value)
+    )
     dilated_line_mask = binary_dilation_3d_jax(buffer, dilation_radius)
 
     # Update cumulative_path_mask: union of current mask and new dilated path
@@ -126,6 +129,66 @@ def draw_path_sphere_2_jax(
 
     return new_cumulative_path_mask, dilated_line_mask
 
+@jax.jit
+def draw_sphere_point(
+    array_3d: jnp.ndarray, center_point: jnp.ndarray, radius: int, fill_value=1
+):
+    """
+    Fills a 3D NumPy array with a specified value inside a sphere.
+
+    Args:
+        array_3d (np.ndarray): The 3D NumPy array (e.g., of zeros) to modify.
+                                Its shape defines the coordinate space.
+        center_point (tuple or list or np.ndarray): The (x, y, z) coordinates
+                                                     of the sphere's center.
+        radius (float or int): The radius of the sphere.
+        fill_value (int or float, optional): The value to fill inside the sphere.
+                                             Defaults to 1.
+
+    Returns:
+        np.ndarray: The modified 3D array with the sphere filled.
+    """
+    # Generate 1D coordinate arrays for each axis using np.ogrid
+    # These will broadcast to the full 3D shape for the distance calculation
+    # We take the actual shape of the input array for coordinates
+    x, y, z = jnp.ogrid[
+        0 : array_3d.shape[0], 0 : array_3d.shape[1], 0 : array_3d.shape[2]
+    ]
+
+    # Calculate the squared distance from the sphere's center for every point
+    distance_squared = (
+        (x - center_point[0]) ** 2
+        + (y - center_point[1]) ** 2
+        + (z - center_point[2]) ** 2
+    )
+    # Fill the array at the appropriate places using the boolean mask
+    return jnp.where(distance_squared <= radius**2, fill_value, array_3d)
+
+
+@jax.jit
+def draw_sphere_line(array_3d: jnp.ndarray, pts: tuple, radius: int, fill_value=1):
+    return jax.lax.scan(
+        lambda a, p: (draw_sphere_point(a, p, radius, fill_value), p),
+        array_3d,
+        jnp.asarray(pts).T,
+    )[0]
+
+
+def draw_path_sphere(array_3d: jnp.ndarray, pts: tuple, radius: int, fill_value=True):
+    """
+    Draws a sphere around each point in the path defined by `pts` in the 3D array.
+
+    Args:
+        array_3d: The 3D array to update.
+        pts: A tuple containing the coordinates of the path points (e.g., from `line_nd_jax`).
+        radius: The radius for the spheres to be drawn around each point.
+        fill_value: The value to fill inside the spheres.
+    """
+    # Draw spheres around each point in the path
+    new_array_3d = draw_sphere_line(jnp.zeros_like(array_3d), pts, radius, fill_value)
+    # Update the original array with the new spheres
+    updated_array_3d = jnp.maximum(array_3d, new_array_3d)
+    return updated_array_3d, new_array_3d
 
 @struct.dataclass
 class SmallBowelState(environment.EnvState):
@@ -162,9 +225,6 @@ class SmallBowelParams(environment.EnvParams):
     r_peaks: float = 10.0
     gdt_max_increase_theta: float = 5.0
     max_step_vox: float = 5.0  # Max movement in voxels
-    # patch_size_vox: jnp.ndarray = field(
-    #     default_factory=lambda: jnp.array([32, 32, 32], dtype=jnp.int32)
-    # )
     patch_size_vox: jnp.ndarray = struct.field(
         pytree_node=False,
         default=(32, 32, 32),  # Default patch size in voxels
@@ -310,10 +370,8 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
         # Mark initial position on cumulative path mask
         line = line_nd_jax(current_pos_vox, current_pos_vox, 256)
-        cumulative_path_mask, _ = draw_path_sphere_2_jax(
-            cumulative_path_mask,
-            line,
-            params.cumulative_path_radius_vox,
+        cumulative_path_mask, _ = draw_path_sphere(
+            cumulative_path_mask, line, params.cumulative_path_radius_vox, True
         )
 
         # Initialize various tracking variables
@@ -447,7 +505,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
                 done,
                 state.length,
                 0.0,
-            ),  # Simplified length
+            ),
             "final_wall_gradient": jax.lax.select(done, state.wall_gradient, 0.0),
             "total_reward": jax.lax.select(done, state.cum_reward, 0.0),
             "max_gdt_achieved": state.max_gdt_achieved,
@@ -568,8 +626,8 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         new_reward_map = reward_map.at[line[0], line[1], line[2]].set(0.0)
 
         # Update cumulative path mask
-        new_cumulative_path_mask, coverage = draw_path_sphere_2_jax(
-            cumulative_path_mask, line, cumulative_path_radius_vox
+        new_cumulative_path_mask, coverage = draw_path_sphere(
+            cumulative_path_mask, line, cumulative_path_radius_vox, True
         )
 
         # Reward for coverage (based on Dice within the segmentation on the path)
@@ -609,7 +667,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             params.wall_map, state.current_pos_vox, params.patch_size_vox
         )
         cum_path_patch = get_patch_jax(
-            state.cumulative_path_mask.astype(jnp.float32),
+            state.cumulative_path_mask,
             state.current_pos_vox,
             params.patch_size_vox,
         )
