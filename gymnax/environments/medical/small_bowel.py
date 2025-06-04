@@ -606,7 +606,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         # --- 2. GDT-based reward ---
         next_gdt_val = gdt_map[tuple(next_pos_vox)]
         delta = next_gdt_val - max_gdt_achieved
-        rt += jax.lax.select(
+        rt = rt + jax.lax.select(
             delta > 0,
             jax.lax.select(
                 delta > gdt_max_increase_theta,
@@ -617,10 +617,16 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         )
 
         # --- 2.5 Peaks-based reward ---
-        peaks_reward_sum = jnp.sum(
-            reward_map.at[line[0], line[1], line[2]].get(indices_are_sorted=True).mean()
+        peaks_reward_sum = reward_map.at[line[0], line[1], line[2]].get(
+            indices_are_sorted=True
         )
-        rt += peaks_reward_sum * r_peaks
+        # Since the (sorted) indices include many repeated voxels
+        # (due to the way we index with a fixed number of samples),
+        # we can find the number of gradient points to get the proper number of peaks.
+        peaks_reward_sum = jnp.sum(
+            (peaks_reward_sum[1:] - peaks_reward_sum[:-1]) > 0
+        )  # Count non-zero peaks
+        rt = rt + peaks_reward_sum * r_peaks
 
         # Discard the reward for visited nodes (set to 0 in reward_map)
         new_reward_map = reward_map.at[line[0], line[1], line[2]].set(0.0)
@@ -631,15 +637,20 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         )
 
         # Reward for coverage (based on Dice within the segmentation on the path)
-        intersection = jnp.sum(coverage * seg)
-        union = seg_volume + jnp.sum(coverage)
-        coverage = jax.lax.select(union != 0, 2 * intersection / union, 0.0)
+        patch = cumulative_path_mask.at[line[0], line[1], line[2]].get(
+            indices_are_sorted=True
+        )
+        coverage = coverage.at[line[0], line[1], line[2]].get(indices_are_sorted=True)
+        intersection = jnp.sum(patch * coverage)
+
+        union = jnp.sum(patch) + jnp.sum(coverage)
+        coverage = 2 * intersection / union
         rt = rt + coverage * r_val2
 
         # --- 3. Wall-based penalty ---
         wall_map_max = wall_map.at[line[0], line[1], line[2]].get().max()
         wall_stuff = wall_map_max
-        rt = rt - r_val2 * wall_map_max * 30
+        rt = rt - r_val2 * wall_map_max * 30  # 0.03 is basically equivalent to a wall
 
         # --- 4. Revisiting penalty ---
         revisit_penalty = (
@@ -652,7 +663,6 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         # Penalty if next position is outside segmentation
         # This was `if not self.seg_np[next_pos_vox]: rt -= self.config.r_val1`
         # This is now covered by `cond_invalid_move` at the top level.
-        # If we reach here, it means `is_in_seg` was True.
         return rt, new_cumulative_path_mask, new_reward_map, wall_stuff
 
     @partial(jax.jit, static_argnames=("self",))
@@ -692,10 +702,11 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         # Max steps reached
         max_steps_reached = state.time >= params.max_steps_in_episode
 
-        # Out of bounds or invalid move (already checked in _calculate_reward, but re-check for termination)
+        # Out of bounds or invalid move (already checked in _calculate_reward,
+        # but re-check for termination)
         is_next_pos_valid = _is_valid_pos(next_pos_vox, params.image_shape)
         # is_in_seg = jnp.where(
-        #     is_next_pos_valid, params.seg[tuple(next_pos_vox)] > 0, False
+        #    is_next_pos_valid, params.seg[tuple(next_pos_vox)] > 0, False
         # )
 
         invalid_move = (
