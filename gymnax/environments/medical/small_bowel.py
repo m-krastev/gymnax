@@ -2,6 +2,7 @@
 
 from dataclasses import field
 from functools import partial
+from math import sqrt
 
 import jax
 import jax.numpy as jnp
@@ -58,6 +59,7 @@ def line_nd_jax(
         jnp.linspace(start, stop, num=max_npoints, endpoint=False).T
     ).astype(int)
 
+
 @partial(
     jax.jit,
 )
@@ -98,7 +100,7 @@ def binary_dilation_3d_jax(mask: jnp.ndarray, radius: int) -> jnp.ndarray:
     )[0, ..., 0]  # Remove batch and channel dimensions
 
 
-def draw_path_sphere(
+def draw_path_sphere_conv(
     cumulative_path_mask: jnp.ndarray,
     line: tuple[jnp.ndarray],
     dilation_radius: int,
@@ -128,6 +130,7 @@ def draw_path_sphere(
     new_cumulative_path_mask = cumulative_path_mask | dilated_line_mask
 
     return new_cumulative_path_mask, dilated_line_mask
+
 
 @jax.jit
 def draw_sphere_point(
@@ -190,11 +193,14 @@ def draw_path_sphere(array_3d: jnp.ndarray, pts: tuple, radius: int, fill_value=
     updated_array_3d = jnp.maximum(array_3d, new_array_3d)
     return updated_array_3d, new_array_3d
 
+
 @struct.dataclass
 class SmallBowelState(environment.EnvState):
     """State of the Small Bowel environment."""
 
     current_pos_vox: jnp.ndarray  # (3,) int
+    goal: jnp.ndarray  # (3,) int
+    gdt: jnp.ndarray  # (D, H, W) float, GDT map for current episode
     cumulative_path_mask: jnp.ndarray  # (D, H, W) bool
     max_gdt_achieved: float
     cum_reward: float
@@ -219,12 +225,12 @@ class SmallBowelParams(environment.EnvParams):
     goal: jnp.ndarray  # (3,) int (this will be set in reset, but needs a default)
 
     r_zero_mov: float = 10.0
-    r_val1: float = 1.0
-    r_val2: float = 1.0
+    r_val1: float = 4.0
+    r_val2: float = 6.0
     r_final: float = 100.0
-    r_peaks: float = 10.0
-    gdt_max_increase_theta: float = 5.0
-    max_step_vox: float = 5.0  # Max movement in voxels
+    r_peaks: float = 4.0
+    max_step_vox: float = 10.0  # Max movement in voxels
+    gdt_max_increase_theta: float = sqrt(3) * 10.0
     patch_size_vox: jnp.ndarray = struct.field(
         pytree_node=False,
         default=(32, 32, 32),  # Default patch size in voxels
@@ -365,7 +371,6 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         gdt_map = jax.lax.select(is_valid_start, gdt_map, params.gdt_start)
 
         # Initialize path tracking
-        # print(params.image_shape)
         cumulative_path_mask = jnp.zeros_like(params.image, dtype=jnp.bool_)
 
         # Mark initial position on cumulative path mask
@@ -388,6 +393,8 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         state = SmallBowelState(
             time=0,  # EnvState's time
             current_pos_vox=current_pos_vox,
+            goal=goal,
+            gdt=gdt_map,
             cumulative_path_mask=cumulative_path_mask,
             max_gdt_achieved=max_gdt_achieved,
             cum_reward=cum_reward,
@@ -425,7 +432,8 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
                 action_vox_delta,
                 state.cumulative_path_mask,
                 state.reward_map,
-                params.gdt_start,  # Use gdt_start as the base GDT map for reward calculation
+                # Use gdt_start as the base GDT map for reward calculation
+                state.gdt,
                 params.seg,
                 params.wall_map,
                 params.gt_path_vol,
@@ -447,7 +455,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
         # Update max_gdt_achieved based on the GDT map used for reward calculation
         new_max_gdt_achieved = jnp.maximum(
-            state.max_gdt_achieved, params.gdt_start[tuple(next_pos_vox)]
+            state.max_gdt_achieved, state.gdt[tuple(next_pos_vox)]
         )
 
         # Check Termination Conditions
@@ -468,7 +476,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         # This is simplified as JAX doesn't easily allow string reasons in jit.
         # We'll use boolean flags.
         reached_goal = (
-            jnp.linalg.norm(next_pos_vox - params.goal)
+            jnp.linalg.norm(next_pos_vox - state.goal)
             < params.cumulative_path_radius_vox
         )
 
@@ -487,6 +495,8 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         state = SmallBowelState(
             time=state.time + 1,
             current_pos_vox=next_pos_vox,
+            goal=state.goal,
+            gdt=state.gdt,  # Use gdt_start for the next step
             cumulative_path_mask=new_cumulative_path_mask,
             max_gdt_achieved=new_max_gdt_achieved,
             cum_reward=new_cum_reward,
@@ -687,7 +697,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         critic_state = jnp.stack([img_patch, wall_patch, cum_path_patch], axis=0)
 
         # For Gymnax, we return the raw observation. The agent will handle batching.
-        return jnp.stack([actor_state, critic_state], axis=0)
+        return jnp.concatenate([actor_state, critic_state], axis=0)
 
     @partial(jax.jit, static_argnames=("self",))
     def is_terminal(
@@ -718,7 +728,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
         # Reached goal
         reached_goal = (
-            jnp.linalg.norm(next_pos_vox - params.goal)
+            jnp.linalg.norm(next_pos_vox - state.goal)
             < params.cumulative_path_radius_vox
         )
 
