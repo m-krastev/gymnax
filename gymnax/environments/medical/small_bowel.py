@@ -194,21 +194,6 @@ def draw_path_sphere(array_3d: jnp.ndarray, pts: tuple, radius: int, fill_value=
     return updated_array_3d, new_array_3d
 
 
-@struct.dataclass
-class SmallBowelState(environment.EnvState):
-    """State of the Small Bowel environment."""
-
-    current_pos_vox: jnp.ndarray  # (3,) int
-    goal: jnp.ndarray  # (3,) int
-    gdt: jnp.ndarray  # (D, H, W) float, GDT map for current episode
-    cumulative_path_mask: jnp.ndarray  # (D, H, W) bool
-    max_gdt_achieved: float
-    cum_reward: float
-    reward_map: jnp.ndarray  # (D, H, W) float, for peaks
-    wall_gradient: float
-    length: float
-
-
 @struct.dataclass(kw_only=True)
 class SmallBowelParams(environment.EnvParams):
     """Parameters for the Small Bowel environment."""
@@ -222,7 +207,12 @@ class SmallBowelParams(environment.EnvParams):
     local_peaks: jnp.ndarray  # (N, 3) int
     start_coord: jnp.ndarray  # (3,) int
     end_coord: jnp.ndarray  # (3,) int
-    goal: jnp.ndarray  # (3,) int (this will be set in reset, but needs a default)
+    # seg_volume should be kept in the state, but since at each reset we have to
+    # calculate it, it's better to keep it in the static parameters.
+    seg_volume: float
+    # I'd like to avoid passing the image shape as a parameter,
+    # but the compiler will complain otherwise.
+    image_shape: jnp.ndarray
 
     r_zero_mov: float = 10.0
     r_val1: float = 4.0
@@ -236,10 +226,21 @@ class SmallBowelParams(environment.EnvParams):
         default=(32, 32, 32),  # Default patch size in voxels
     )
     cumulative_path_radius_vox: int = 3
-    seg_volume: float = 0.0  # Will be calculated from seg
-    image_shape: jnp.ndarray = field(
-        default_factory=lambda: jnp.array([1, 1, 1], dtype=jnp.int32)
-    )
+
+
+@struct.dataclass
+class SmallBowelState(environment.EnvState):
+    """State of the Small Bowel environment."""
+
+    current_pos_vox: jnp.ndarray  # (3,) int
+    goal: jnp.ndarray  # (3,) int
+    gdt: jnp.ndarray  # (D, H, W) float, GDT map for current episode
+    cumulative_path_mask: jnp.ndarray  # (D, H, W) bool
+    max_gdt_achieved: float
+    cum_reward: float
+    reward_map: jnp.ndarray  # (D, H, W) float, for peaks
+    wall_gradient: float
+    length: float
 
 
 class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
@@ -265,7 +266,6 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             local_peaks=jnp.zeros((1, 3), dtype=jnp.int32),
             start_coord=jnp.zeros((3,), dtype=jnp.int32),
             end_coord=jnp.zeros((3,), dtype=jnp.int32),
-            goal=jnp.zeros((3,), dtype=jnp.int32),
             image_shape=jnp.ones((3,), dtype=jnp.int32),  # Placeholder
             seg_volume=0.0,
         )
@@ -473,8 +473,6 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         )
 
         # Determine termination reason for final reward adjustment
-        # This is simplified as JAX doesn't easily allow string reasons in jit.
-        # We'll use boolean flags.
         reached_goal = (
             jnp.linalg.norm(next_pos_vox - state.goal)
             < params.cumulative_path_radius_vox
@@ -507,20 +505,10 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
         obs = self.get_obs(state, params)
 
-        # Info dictionary (simplified for JAX)
+        # Info dictionary (we already store a lot in the state, so no real need for it)
         info = {
             "final_coverage": final_coverage,
-            "final_step_count": jax.lax.select(done, state.time, 0),
-            "final_length": jax.lax.select(
-                done,
-                state.length,
-                0.0,
-            ),
-            "final_wall_gradient": jax.lax.select(done, state.wall_gradient, 0.0),
-            "total_reward": jax.lax.select(done, state.cum_reward, 0.0),
-            "max_gdt_achieved": state.max_gdt_achieved,
         }
-
         return obs, state, reward, done, info
 
     @partial(jax.jit, static_argnames=("self",))
@@ -776,12 +764,12 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             "time": spaces.Discrete(params.max_steps_in_episode + 1),
             "current_pos_vox": spaces.Box(
                 low=jnp.array([0, 0, 0], dtype=jnp.int32),
-                high=jnp.array(params.image_shape, dtype=jnp.int32),
+                high=jnp.array(params.image.shape, dtype=jnp.int32),
                 shape=(3,),
                 dtype=jnp.int32,
             ),
             "cumulative_path_mask": spaces.Box(
-                low=0, high=1, shape=params.image_shape, dtype=jnp.bool_
+                low=0, high=1, shape=params.image.shape, dtype=jnp.bool_
             ),
             "max_gdt_achieved": spaces.Box(
                 low=-jnp.inf, high=jnp.inf, shape=(), dtype=jnp.float32
@@ -790,7 +778,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
                 low=-jnp.inf, high=jnp.inf, shape=(), dtype=jnp.float32
             ),
             "reward_map": spaces.Box(
-                low=0, high=1, shape=params.image_shape, dtype=jnp.float32
+                low=0, high=1, shape=params.image.shape, dtype=jnp.float32
             ),
             "wall_gradient": spaces.Box(
                 low=-jnp.inf, high=jnp.inf, shape=(), dtype=jnp.float32
