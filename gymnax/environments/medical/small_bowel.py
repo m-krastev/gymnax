@@ -17,7 +17,7 @@ def _is_valid_pos(pos_vox: jnp.ndarray, shape: tuple[int, int, int]) -> jnp.ndar
     return jnp.all(pos_vox >= 0) & jnp.all(pos_vox < jnp.array(shape))
 
 
-@partial(jax.jit, static_argnames=("patch_size",))
+@partial(jax.jit, static_argnames=("patch_size",), inline=True)
 def get_patch_jax(
     volume: jnp.ndarray, center_coords: jnp.ndarray, patch_size: jnp.ndarray
 ) -> jnp.ndarray:
@@ -25,14 +25,9 @@ def get_patch_jax(
     Extracts a patch from a 3D volume centered at center_coords.
     Handles padding for out-of-bounds regions.
     """
-    patch = jnp.zeros_like(volume, shape=patch_size)
-
     # Calculate the slice indices for the patch
     start_coords = jnp.maximum(0, center_coords - jnp.asarray(patch_size) // 2)
-    patch = jax.lax.dynamic_update_slice(
-        patch, jax.lax.dynamic_slice(volume, start_coords, patch_size), start_coords
-    )
-    return patch
+    return jax.lax.dynamic_slice(volume, start_coords, patch_size)
 
 
 @partial(jax.jit, static_argnames=("max_npoints",))
@@ -100,7 +95,7 @@ def binary_dilation_3d_jax(mask: jnp.ndarray, radius: int) -> jnp.ndarray:
     )[0, ..., 0]  # Remove batch and channel dimensions
 
 
-def draw_path_sphere_conv(
+def draw_path_sphere(
     cumulative_path_mask: jnp.ndarray,
     line: tuple[jnp.ndarray],
     dilation_radius: int,
@@ -132,7 +127,7 @@ def draw_path_sphere_conv(
     return new_cumulative_path_mask, dilated_line_mask
 
 
-@jax.jit
+@partial(jax.jit, inline=True)
 def draw_sphere_point(
     array_3d: jnp.ndarray, center_point: jnp.ndarray, radius: int, fill_value=1
 ):
@@ -168,15 +163,8 @@ def draw_sphere_point(
     return jnp.where(distance_squared <= radius**2, fill_value, array_3d)
 
 
-@jax.jit
-def draw_sphere_line(array_3d: jnp.ndarray, pts: tuple, radius: int, fill_value=1):
-    return jax.lax.scan(
-        lambda a, p: (draw_sphere_point(a, p, radius, fill_value), p),
-        array_3d,
-        jnp.asarray(pts).T,
-    )[0]
 
-
+@partial(jax.jit)
 def draw_path_sphere(array_3d: jnp.ndarray, pts: tuple, radius: int, fill_value=True):
     """
     Draws a sphere around each point in the path defined by `pts` in the 3D array.
@@ -188,7 +176,11 @@ def draw_path_sphere(array_3d: jnp.ndarray, pts: tuple, radius: int, fill_value=
         fill_value: The value to fill inside the spheres.
     """
     # Draw spheres around each point in the path
-    new_array_3d = draw_sphere_line(jnp.zeros_like(array_3d), pts, radius, fill_value)
+    new_array_3d = jax.lax.scan(
+        lambda a, p: (draw_sphere_point(a, p, radius, fill_value), p),
+        jnp.zeros_like(array_3d),
+        jnp.asarray(pts).T,
+    )[0]
     # Update the original array with the new spheres
     updated_array_3d = jnp.maximum(array_3d, new_array_3d)
     return updated_array_3d, new_array_3d
@@ -270,6 +262,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             seg_volume=0.0,
         )
 
+    @partial(jax.jit, static_argnames=("self",))
     def reset_env(
         self, key: jax.Array, params: SmallBowelParams
     ) -> tuple[jnp.ndarray, SmallBowelState]:
@@ -360,7 +353,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         # Validate start position (simplified check for now)
         is_valid_start = (
             _is_valid_pos(current_pos_vox, params.image_shape)
-            & params.seg[tuple(current_pos_vox)]
+            & params.seg[tuple(current_pos_vox.T)]
         )
 
         # If start is invalid, default to start_coord and gdt_start
@@ -381,7 +374,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
         # Initialize various tracking variables
         cum_reward = 0.0
-        max_gdt_achieved = gdt_map[tuple(current_pos_vox)]
+        max_gdt_achieved = gdt_map[tuple(current_pos_vox.T)]
 
         # Initialize reward_map for peaks
         reward_map = jnp.zeros_like(params.image, dtype=jnp.float32)
@@ -455,7 +448,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
 
         # Update max_gdt_achieved based on the GDT map used for reward calculation
         new_max_gdt_achieved = jnp.maximum(
-            state.max_gdt_achieved, state.gdt[tuple(next_pos_vox)]
+            state.max_gdt_achieved, state.gdt[tuple(next_pos_vox.T)]
         )
 
         # Check Termination Conditions
@@ -602,11 +595,11 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         """Helper for reward calculation when the move is valid."""
 
         # --- 2. GDT-based reward ---
-        next_gdt_val = gdt_map[tuple(next_pos_vox)]
+        next_gdt_val = gdt_map[tuple(next_pos_vox.T)]
         delta = next_gdt_val - max_gdt_achieved
-        rt = rt + jax.lax.select(
+        rt = rt + jnp.where(
             delta > 0,
-            jax.lax.select(
+            jnp.where(
                 delta > gdt_max_increase_theta,
                 -r_val2,
                 r_val2 * (delta / gdt_max_increase_theta),
@@ -680,12 +673,11 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
             params.patch_size_vox,
         )
 
-        # Stack patches for actor and critic
-        actor_state = jnp.stack([img_patch, wall_patch, cum_path_patch], axis=0)
-        critic_state = jnp.stack([img_patch, wall_patch, cum_path_patch], axis=0)
+        # Stack patches for actor and critic (can allow for a 4th)
+        state = jnp.stack([img_patch, wall_patch, cum_path_patch], axis=0)
 
         # For Gymnax, we return the raw observation. The agent will handle batching.
-        return jnp.concatenate([actor_state, critic_state], axis=0)
+        return state
 
     @partial(jax.jit, static_argnames=("self",))
     def is_terminal(
@@ -710,7 +702,7 @@ class SmallBowel(environment.Environment[SmallBowelState, SmallBowelParams]):
         invalid_move = (
             (jnp.all(action_vox_delta == 0))
             | (~is_next_pos_valid)
-            | (wall_stuff > 0.03)
+            # | (wall_stuff > 0.03)
             # | (~is_in_seg)
         )
 
